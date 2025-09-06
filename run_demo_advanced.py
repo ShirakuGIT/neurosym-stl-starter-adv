@@ -95,7 +95,7 @@ def main(args):
         from verify_dreal import delta_sat_check
 
     acc = rej = near = 0
-    backend = args.smt
+    backend = args.cert
 
     for i in top_idx:
         r = float(rho[i].item())
@@ -103,27 +103,30 @@ def main(args):
             rej += 1
             continue
 
+        x0_i    = x0[i].detach().cpu().tolist()
+        u_i     = u_seq[i].detach().cpu().tolist()
+        obs_xy_i= obs_xy.detach().cpu().tolist()
+        obs_r_i = obs_r.detach().cpu().tolist()
+        goal_xy_i = goal_xy.detach().cpu().tolist()
+        goal_r_i  = float(goal_r.item())
+
         ok = True
-        if backend == 'z3':
+        if backend == 'continuous':
+            from verify_continuous import continuous_check_traj
+            ok, _why = continuous_check_traj(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, goal_r_i)
+        elif backend == 'z3':
             from verify_z3 import z3_check_traj
-            u_i = u_seq[i].detach().cpu().tolist()
-            x0_i = x0[i].detach().cpu().tolist()
-            obs_xy_i = obs_xy.detach().cpu().tolist()
-            obs_r_i  = obs_r.detach().cpu().tolist()
-            goal_xy_i= goal_xy.detach().cpu().tolist()
-            ok = z3_check_traj(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, float(goal_r.item()))
+            ok = z3_check_traj(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, goal_r_i)
         elif backend == 'dreal':
             from verify_dreal import delta_sat_check
-            u_i = u_seq[i].detach().cpu().tolist()
-            x0_i = x0[i].detach().cpu().tolist()
-            obs_xy_i = obs_xy.detach().cpu().tolist()
-            obs_r_i  = obs_r.detach().cpu().tolist()
-            goal_xy_i= goal_xy.detach().cpu().tolist()
-            ok = delta_sat_check(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, float(goal_r.item()),
+            ok = delta_sat_check(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, goal_r_i,
                                 delta=args.delta, dreal_path="dreal")
+        else:
+            ok = True  # no extra certification
 
         if ok: acc += 1
         else:  near += 1
+
 
 
     # Best traj
@@ -179,6 +182,10 @@ if __name__ == '__main__':
     p.add_argument('--dreal', action='store_true', help='use dReal δ-SMT gate instead of stub')
     p.add_argument('--smt', type=str, default='none', choices=['none','z3','dreal'],
                help='choose SMT backend: none | z3 | dreal (dReal requires Linux/WSL)')
+    p.add_argument('--cert', type=str, default='continuous',
+               choices=['none','continuous','z3','dreal'],
+               help='final certification backend')
+
 
 
 
