@@ -36,3 +36,23 @@ def spec_bounded_avoid_then_reach(xy, obstacles_xy, obstacles_r, goal_xy, goal_r
 
 def chunked_eval(eval_fn, *args, chunk=32, **kwargs):
     return eval_fn(*args, **kwargs)
+
+# stl_eval fast path (G(avoid) ∧ F(reach)) for a batch (N,T,2)
+def hard_robustness_G_avoid_F_reach(traj, obs_xy, obs_r, goal_xy, goal_r):
+    # traj: (N,T,2), obs_xy: (M,2), obs_r: (M,), goal_xy: (2,), goal_r: scalar
+    N, T, _ = traj.shape
+    if obs_xy.numel() > 0:
+        # pairwise distances: (N,T,M)
+        diff = traj.unsqueeze(2) - obs_xy.view(1,1,-1,2)
+        d = diff.square().sum(-1).sqrt()
+        margin = d - obs_r.view(1,1,-1)          # (N,T,M)
+        rho_avoid_t = margin.min(dim=2).values   # (N,T)
+        G_avoid = rho_avoid_t.min(dim=1).values  # (N,)
+    else:
+        G_avoid = torch.full((N,), 1e6, device=traj.device)
+
+    d_goal = (traj - goal_xy.view(1,1,2)).square().sum(-1).sqrt() # (N,T)
+    rho_goal_t = goal_r - d_goal
+    F_reach = rho_goal_t.max(dim=1).values                         # (N,)
+
+    return torch.minimum(G_avoid, F_reach)                         # (N,)

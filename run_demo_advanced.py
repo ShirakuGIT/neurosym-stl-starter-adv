@@ -7,7 +7,12 @@ from envs import PointMassEnv2D, random_world
 from samplers import sample_with_ddpm_or_fallback
 from stl_eval import spec_G_avoid_and_F_reach, spec_bounded_avoid_then_reach, chunked_eval
 from logging_utils import append_record
-from smt_stub import check_delta_sat
+
+
+import os
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["TORCHINDUCTOR_DISABLE"] = "1"
+
 
 def adaptive_N(N_base, num_obstacles, T, depth=1, num_AP=4, cap=None):
     """
@@ -37,6 +42,19 @@ def main(args):
     os.makedirs('outputs/plots', exist_ok=True)
     os.makedirs('outputs/logs', exist_ok=True)
 
+    # Global seeds (reproducible world + sampling)
+    # Reproducible RNG (must be before random_world)
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        import random as _py_random
+        _py_random.seed(args.seed)
+
+    world_seed_used = args.world_seed if (args.world_seed is not None and args.world_seed >= 0) \
+                      else torch.randint(0, 10_000_000, (1,)).item()
+    torch.manual_seed(world_seed_used)
+    np.random.seed(world_seed_used)
+
     N = adaptive_N(args.N_base, args.num_obstacles, args.T,
                    depth=2 if args.spec == 'bounded' else 1,
                    num_AP=2 + args.num_obstacles,
@@ -45,18 +63,124 @@ def main(args):
     env = PointMassEnv2D(dt=args.dt)
     x0, obs_xy, obs_r, goal_xy, goal_r = random_world(N, args.num_obstacles, device=device)
 
-    from guidance import add_goal_bias
-    from repair   import one_step_repair
+    x0      = x0.contiguous()
+    obs_xy  = obs_xy.contiguous()
+    obs_r   = obs_r.contiguous()
+    goal_xy = goal_xy.contiguous()
+    goal_r  = goal_r.contiguous()
 
+        # ---------------- Hard robustness (torch, no specs module) ----------------
+    def _hard_rho_of(traj_T2):
+        """
+        traj_T2: (T,2) positions for a single trajectory on current device.
+        Hard STL: G(avoid) ∧ F(reach)
+        """
+        # G(avoid)
+        if obs_xy.numel() > 0:
+            diff = traj_T2.unsqueeze(1) - obs_xy.unsqueeze(0)       # (T, nObs, 2)
+            dists = torch.linalg.norm(diff, dim=-1)                 # (T, nObs)
+            margins = dists - obs_r.unsqueeze(0)                    # (T, nObs)
+            rho_avoid_t = margins.min(dim=1).values                 # (T,)
+            G_avoid = rho_avoid_t.min()
+        else:
+            G_avoid = torch.tensor(1e6, device=traj_T2.device)
+
+        # F(reach)
+        d_goal = torch.linalg.norm(traj_T2 - goal_xy.unsqueeze(0), dim=-1)  # (T,)
+        rho_goal_t = goal_r - d_goal                                        # (T,)
+        F_reach = rho_goal_t.max()
+
+        return torch.minimum(G_avoid, F_reach)
+
+    # ---------------- Produce u_seq exactly once, based on baseline ----------------
+    N = x0.shape[0]  # batch size
     t0 = time.time()
-    # gentler sampler (you already have the gentler defaults in samplers.py)
-    u_seq = sample_with_ddpm_or_fallback(N, args.T, device=device, max_speed=1.6)
-    # add a small goal-directed pull at each step
-    u_seq = add_goal_bias(x0, u_seq, goal_xy, dt=args.dt, beta=0.35, max_speed=1.6)
-    # stronger one-step repair to clear obstacles
-    # u_seq = one_step_repair(x0, u_seq, obs_xy, obs_r, dt=args.dt, alpha=1.2, d_safe=0.25)
-    # simulate for evaluation
-    traj  = env.simulate(x0, u_seq)
+
+    if args.baseline == 'opt':
+        from optimize_stl_annealed import optimize_controls_annealed
+
+        # how many starts to actually optimize (rest will use sampler fallback)
+        opt_count = N if (args.opt_max is None or args.opt_max <= 0) else min(args.opt_max, N)
+        u_seq = torch.zeros((N, args.T, 2), device=device)
+
+        # run optimizer for the first opt_count starts
+        for i in range(opt_count):
+            print(f"[opt] optimizing start {i+1}/{opt_count}…", flush=True)
+            u_i, _ = optimize_controls_annealed(
+                x0=x0[i],
+                obs_xy=obs_xy, obs_r=obs_r,
+                goal_xy=goal_xy, goal_r=goal_r,
+                T=args.T, dt=args.dt,
+                hard_eval_fn=_hard_rho_of
+            )
+            if not torch.is_tensor(u_i):
+                u_i = torch.tensor(u_i, dtype=torch.float32, device=device)
+            u_seq[i] = u_i.to(device)
+
+        # fill the remainder with our heuristic sampler
+        if opt_count < N:
+            from guidance import add_goal_bias
+            u_fallback = sample_with_ddpm_or_fallback(N - opt_count, args.T, device=device, max_speed=1.6)
+            u_fallback = add_goal_bias(x0[opt_count:], u_fallback, goal_xy, dt=args.dt, beta=0.35, max_speed=1.6)
+            u_seq[opt_count:] = u_fallback
+
+    elif args.baseline == 'opt_from_rrt':
+        from rrtgeom import plan_rrt_star, path_to_controls
+        from optimize_stl_annealed import optimize_controls_annealed
+
+        max_speed = 1.6
+        u_seq = torch.zeros((N, args.T, 2), device=device)
+        # optionally only optimize a subset (keeps rigor; you’ll report budget)
+        opt_count = N if (args.opt_max is None or args.opt_max <= 0) else min(args.opt_max, N)
+
+        for i in range(opt_count):
+            if (i % 25) == 0:
+                print(f"[opt] optimizing start {i+1}/{opt_count}…", flush=True)
+
+            path = plan_rrt_star(
+            x0=x0[i],                         # tensor
+            goal_xy=goal_xy,                  # tensor
+            obs_xy=obs_xy,                    # tensor
+            obs_r=obs_r,                      # tensor
+            max_iter=4000, step=0.30, r_rewire=0.60,
+            goal_sample_rate=0.10, goal_thresh=float(goal_r.item()*0.9),
+            xmin=-5.0, xmax=5.0, ymin=-5.0, ymax=5.0,
+            seed=int(args.world_seed if args.world_seed is not None else 0)
+        )
+            if path is None or len(path) < 2:
+                # no warm start; zeros let optimizer try locally
+                init_u = None
+            else:
+                init_u = path_to_controls(path, T=args.T, dt=args.dt, max_speed=1.6, device=device)
+
+            u_i, _ = optimize_controls_annealed(
+                x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+                goal_xy=goal_xy, goal_r=goal_r,
+                T=args.T, dt=args.dt, init_u=init_u,
+                hard_eval_fn=_hard_rho_of,  # your hard evaluator from earlier
+                taus=(0.6, 0.3, 0.15, 0.08), iters_per_tau=80, lr=0.25, max_speed=max_speed
+            )
+            u_seq[i] = u_i.to(device)
+
+        if opt_count < N:
+            from guidance import add_goal_bias
+            u_fallback = sample_with_ddpm_or_fallback(N - opt_count, args.T, device=device, max_speed=max_speed)
+            u_fallback = add_goal_bias(x0[opt_count:], u_fallback, goal_xy, dt=args.dt, beta=0.35, max_speed=max_speed)
+            u_seq[opt_count:] = u_fallback
+
+
+    elif args.baseline == 'ours':
+        from guidance import add_goal_bias
+        # from repair import one_step_repair  # optional
+        u_seq = sample_with_ddpm_or_fallback(N, args.T, device=device, max_speed=1.6)
+        u_seq = add_goal_bias(x0, u_seq, goal_xy, dt=args.dt, beta=0.35, max_speed=1.6)
+        # u_seq = one_step_repair(x0, u_seq, obs_xy, obs_r, dt=args.dt, alpha=1.2, d_safe=0.25)
+
+    else:
+        raise NotImplementedError(f"baseline {args.baseline} not wired yet")
+
+    # Simulate once
+    traj = env.simulate(x0, u_seq)
     t1 = time.time()
 
 
@@ -75,18 +199,7 @@ def main(args):
     idx_sorted = torch.argsort(rho, descending=True)
     top_idx = [i.item() for i in idx_sorted if mask[i]][:args.K]
 
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-    import random, numpy as np
-    random.seed(args.seed)
-    np.random.seed(args.seed)
 
-    if args.world_seed is not None and args.world_seed >= 0:
-        ws = args.world_seed
-    else:
-        ws = torch.randint(0, 10_000_000, (1,)).item()
-    torch.manual_seed(ws)  # world sampling seed
-    world_seed_used = ws
 
     # δ-SMT stub stats
     # before: from smt_stub import check_delta_sat
@@ -103,11 +216,11 @@ def main(args):
             rej += 1
             continue
 
-        x0_i    = x0[i].detach().cpu().tolist()
-        u_i     = u_seq[i].detach().cpu().tolist()
-        obs_xy_i= obs_xy.detach().cpu().tolist()
-        obs_r_i = obs_r.detach().cpu().tolist()
-        goal_xy_i = goal_xy.detach().cpu().tolist()
+        x0_i    = x0[i].detach().cpu().numpy().tolist()
+        u_i     = u_seq[i].detach().cpu().numpy().tolist()
+        obs_xy_i= obs_xy.detach().cpu().numpy().tolist()
+        obs_r_i = obs_r.detach().cpu().numpy().tolist()
+        goal_xy_i = goal_xy.detach().cpu().numpy().tolist()
         goal_r_i  = float(goal_r.item())
 
         ok = True
@@ -185,6 +298,17 @@ if __name__ == '__main__':
     p.add_argument('--cert', type=str, default='continuous',
                choices=['none','continuous','z3','dreal'],
                help='final certification backend')
+    p.add_argument('--baseline', type=str, default='ours',
+    choices=['ours','opt','rrt','opt_from_rrt','opt_from_ddpm'],
+    help='pipeline to run')
+    p.add_argument('--opt_max', type=int, default=None,
+                help='If set, only optimize this many starts; others use sampler.')
+    p.add_argument('--batch_opt', type=int, default=32,
+                help='Batch width for the (optional) batched optimizer path.')
+
+
+
+
 
 
 
