@@ -44,3 +44,6 @@ def append_record(path, rec: dict):
         # Fill missing fields in this rec
         row = {k: rec.get(k, "") for k in fieldnames}
         writer.writerow(row)
+
+def now_timestamp():
+    return datetime.utcnow().isoformat()

@@ -10,6 +10,9 @@ import argparse, os, time
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+# add these imports
+from prior_utils import encode_env, sample_knots_ddpm
+
 
 from envs import PointMassEnv2D, random_world
 from samplers import sample_with_ddpm_or_fallback
@@ -280,6 +283,83 @@ def main(args):
         u_seq = sample_with_ddpm_or_fallback(N, args.T, device=device, max_speed=1.6)
         u_seq = add_goal_bias(x0, u_seq, goal_xy, dt=args.dt, beta=0.35, max_speed=1.6)
 
+    elif args.baseline == 'opt_basis_from_ddpm':
+        assert args.prior_ckpt is not None, "Provide --prior_ckpt"
+        # 1) Rebuild the model exactly like in train_prior.py
+        try:
+            from prior_model import TinyUNet  # same class used during training
+        except Exception as e:
+            raise RuntimeError("Import TinyUNet from train_prior.py failed. Make sure the class is defined and importable.") from e
+
+        # Load checkpoint
+        ckpt = torch.load(args.prior_ckpt, map_location=device)
+        meta = ckpt.get('meta', {})
+        K_ckpt = int(meta.get('K', args.K_basis))
+        max_obs = int(meta.get('max_obs', 8))
+        Tdiff = int(meta.get('Tdiff', 1000))
+
+        # Instantiate and load weights
+        # cond_dim = 2 + 2 + 1 + 2*max_obs + max_obs + 1  # must match encode_env
+        in_dim = 2 * args.K_basis
+        cond_dim = getattr(args, "prior_cond_dim", 30)
+        hidden = getattr(args, "prior_hidden", 256)
+        model = TinyUNet(in_dim=2*K_ckpt, cond_dim=cond_dim)  # adapt to your signature
+        state_dict = ckpt if isinstance(ckpt, dict) else ckpt.state_dict()
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        # Infer time_in_dim from the checkpoint (1 means raw t)
+        time_in_dim = state_dict.get("time_mlp.0.weight", None)
+        if time_in_dim is not None:
+            time_in_dim = time_in_dim.shape[1]
+        else:
+            time_in_dim = 1  # safe default for your checkpoint
+        
+        model.load_state_dict(state_dict)
+        model.to(device).eval()
+        model.Tdiff = Tdiff  # so sampler can find it
+
+        from optimize_basis_bridge import optimize_basis_from_knots
+        max_speed = 1.6
+        u_seq = torch.zeros((N, args.T, 2), device=device)
+
+        opt_count = N if (args.opt_max is None or args.opt_max <= 0) else min(args.opt_max, N)
+        warm_hits = 0  # not relevant here, keep for symmetry
+
+        for i in range(opt_count):
+            if (i % 25) == 0:
+                print(f"[opt_basis(ddpm)] optimizing start {i+1}/{opt_count}…", flush=True)
+
+            # 2) Condition vector (same as dataset)
+            cond_vec = encode_env(x0[i], obs_xy, obs_r, goal_xy, goal_r, max_obs=max_obs)
+
+            # 3) Sample knots from the prior
+            K_use = int(args.K_basis)
+            knots0 = sample_knots_ddpm(
+                model, cond_vec, K=K_use,
+                steps=args.prior_steps if args.prior_steps is not None else None,
+                device=device
+            )
+
+            # 4) Refine with basis optimizer
+            u_i, _ = optimize_basis_from_knots(
+                x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+                goal_xy=goal_xy, goal_r=goal_r,
+                K=K_use, T=args.T, dt=args.dt,
+                init_knots=knots0,
+                iters=(args.iters_basis if hasattr(args, 'iters_basis') else 200),
+                lr=0.3, max_speed=max_speed,
+                hard_eval_fn=_hard_rho_of
+            )
+            u_seq[i] = u_i.to(device)
+
+        if opt_count < N:
+            from guidance import add_goal_bias
+            u_fallback = sample_with_ddpm_or_fallback(N - opt_count, args.T, device=device, max_speed=max_speed)
+            u_fallback = add_goal_bias(x0[opt_count:], u_fallback, goal_xy, dt=args.dt, beta=0.35, max_speed=max_speed)
+            u_seq[opt_count:] = u_fallback
+
+
     else:
         raise NotImplementedError(f"baseline {args.baseline} not wired yet")
 
@@ -416,8 +496,8 @@ if __name__ == '__main__':
                    help='final certification backend')
 
     p.add_argument('--baseline', type=str, default='ours',
-                   choices=['ours', 'opt', 'rrt', 'opt_from_rrt', 'opt_from_ddpm', 'opt_basis_from_rrt'],
-                   help='pipeline to run')
+                    choices=['ours','opt','rrt','opt_from_rrt','opt_from_ddpm','opt_basis_from_rrt','opt_basis_from_ddpm'],
+                    help='pipeline to run')
 
     p.add_argument('--opt_max', type=int, default=None,
                    help='If set, only optimize this many starts; others use sampler.')
@@ -429,6 +509,11 @@ if __name__ == '__main__':
                    help='Number of B-spline knots for basis optimization.')
     p.add_argument('--iters_basis', type=int, default=200,
                    help='Iterations per tau for basis optimizer.')
+    # in __main__ argparse section
+    p.add_argument('--prior_ckpt', type=str, default=None, help='Path to trained prior .pt')
+    p.add_argument('--prior_steps', type=int, default=None, help='Override diffusion steps for sampling')
+    p.add_argument('--prior_cond_dim', type=int, default=30)
+    p.add_argument('--prior_hidden', type=int, default=256)
 
     args = p.parse_args()
     main(args)
