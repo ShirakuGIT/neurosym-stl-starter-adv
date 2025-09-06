@@ -21,7 +21,7 @@ def sample_smooth_controls(B, T, device, max_speed=1.6, smooth_k=15, noise_scale
 # Optional DDPM prior (tiny). If no checkpoint, fall back to smoothing sampler.
 def sample_with_ddpm_or_fallback(B, T, device, max_speed=1.6):
     try:
-        from prior_ddpm.infer import PriorSampler
+        from infer import PriorSampler
         ckpt = Path('outputs/checkpoints/prior.pt')
         if ckpt.exists():
             sampler = PriorSampler(str(ckpt), device)

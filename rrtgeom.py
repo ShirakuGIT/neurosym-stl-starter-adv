@@ -1,6 +1,6 @@
 # rrtgeom.py
 import torch
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Sequence
 
 def collides_point(p: torch.Tensor, obs_xy: torch.Tensor, obs_r: torch.Tensor, margin: float = 0.0) -> bool:
     d = torch.linalg.norm(obs_xy - p.unsqueeze(0), dim=-1)  # (nObs,)
@@ -15,12 +15,50 @@ def collides_segment(p: torch.Tensor, q: torch.Tensor, obs_xy: torch.Tensor, obs
             return True
     return False
 
+def path_to_knots(path: List[Sequence[float]], K: int) -> torch.Tensor:
+    """
+    Choose K roughly equally spaced points along a polyline path [(x,y), ...].
+    Returns (K,2) tensor of knot positions (on CPU; move to device as needed).
+    """
+    pts = torch.as_tensor(path, dtype=torch.float32)  # (M,2)
+    M = pts.shape[0]
+    if M == 0:
+        return torch.zeros(K, 2, dtype=torch.float32)
+    if M == 1:
+        return pts.repeat(K, 1)
+
+    # cumdist along path
+    seg = pts[1:] - pts[:-1]
+    seg_len = torch.linalg.norm(seg, dim=-1)
+    s = torch.cat([torch.zeros(1), torch.cumsum(seg_len, dim=0)], dim=0)  # (M,)
+    total = float(s[-1].item()) if s[-1] > 0 else 1.0
+
+    # target arc-lengths
+    target = torch.linspace(0.0, total, steps=K)
+    knots = torch.zeros(K, 2, dtype=torch.float32)
+
+    # for each target, find enclosing segment and interpolate
+    j = 0
+    for i, si in enumerate(target):
+        # advance segment index
+        while j+1 < s.numel() and s[j+1] < si:
+            j += 1
+        if j+1 >= s.numel():
+            knots[i] = pts[-1]
+        else:
+            t = (si - s[j]) / max(s[j+1]-s[j], 1e-9)
+            knots[i] = pts[j] + t * (pts[j+1] - pts[j])
+
+    return knots
+
 class _Node:
     __slots__ = ("pt", "parent", "cost")
     def __init__(self, pt: torch.Tensor, parent: Optional[int], cost: float):
         self.pt = pt
         self.parent = parent  # int or None
         self.cost = cost
+
+
 
 def plan_rrt_star(
     x0: torch.Tensor,

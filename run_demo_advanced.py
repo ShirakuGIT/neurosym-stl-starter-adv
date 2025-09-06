@@ -1,17 +1,24 @@
+# run_demo_advanced.py
+# ----------------------------------------------------------------------
+# MUST come before importing torch to actually disable compilation stacks.
+import os as _os
+_os.environ["TORCH_COMPILE_DISABLE"] = "1"
+_os.environ["TORCHINDUCTOR_DISABLE"] = "1"
+# ----------------------------------------------------------------------
+
 import argparse, os, time
-import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
 
 from envs import PointMassEnv2D, random_world
 from samplers import sample_with_ddpm_or_fallback
-from stl_eval import spec_G_avoid_and_F_reach, spec_bounded_avoid_then_reach, chunked_eval
+from stl_eval import (
+    spec_G_avoid_and_F_reach,
+    spec_bounded_avoid_then_reach,
+    chunked_eval,
+)
 from logging_utils import append_record
-
-
-import os
-os.environ["TORCH_COMPILE_DISABLE"] = "1"
-os.environ["TORCHINDUCTOR_DISABLE"] = "1"
 
 
 def adaptive_N(N_base, num_obstacles, T, depth=1, num_AP=4, cap=None):
@@ -23,64 +30,82 @@ def adaptive_N(N_base, num_obstacles, T, depth=1, num_AP=4, cap=None):
         N = min(N, cap)
     return max(1, N)
 
+
 def plot_world(traj, obs_xy, obs_r, goal_xy, goal_r, title, outpath):
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.set_aspect('equal')
+
     for i in range(len(obs_xy)):
         c = plt.Circle(obs_xy[i], obs_r[i], fill=False)
         ax.add_artist(c)
+
     g = plt.Circle(goal_xy, goal_r, color='green', fill=False, linestyle='--')
     ax.add_artist(g)
+
     ax.scatter(traj[0, 0], traj[0, 1], s=40, label='start')
     ax.plot(traj[:, 0], traj[:, 1], label='best traj')
-    ax.set_xlim(-5, 5); ax.set_ylim(-5, 5)
-    ax.set_title(title); ax.grid(True); ax.legend()
-    fig.savefig(outpath, dpi=160); plt.close(fig)
+
+    ax.set_xlim(-5, 5)
+    ax.set_ylim(-5, 5)
+    ax.set_title(title)
+    ax.grid(True)
+    ax.legend()
+    fig.savefig(outpath, dpi=160)
+    plt.close(fig)
+
 
 def main(args):
     device = torch.device(args.device if (args.device == 'cpu' or torch.cuda.is_available()) else 'cpu')
     os.makedirs('outputs/plots', exist_ok=True)
     os.makedirs('outputs/logs', exist_ok=True)
 
-    # Global seeds (reproducible world + sampling)
-    # Reproducible RNG (must be before random_world)
+    # ---------- Reproducible RNG ----------
     if args.seed is not None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         import random as _py_random
         _py_random.seed(args.seed)
 
-    world_seed_used = args.world_seed if (args.world_seed is not None and args.world_seed >= 0) \
-                      else torch.randint(0, 10_000_000, (1,)).item()
+    world_seed_used = (
+        args.world_seed
+        if (args.world_seed is not None and args.world_seed >= 0)
+        else torch.randint(0, 10_000_000, (1,)).item()
+    )
     torch.manual_seed(world_seed_used)
     np.random.seed(world_seed_used)
 
-    N = adaptive_N(args.N_base, args.num_obstacles, args.T,
-                   depth=2 if args.spec == 'bounded' else 1,
-                   num_AP=2 + args.num_obstacles,
-                   cap=args.N_cap)
+    # ---------- Problem size ----------
+    N = adaptive_N(
+        args.N_base,
+        args.num_obstacles,
+        args.T,
+        depth=2 if args.spec == 'bounded' else 1,
+        num_AP=2 + args.num_obstacles,
+        cap=args.N_cap,
+    )
 
     env = PointMassEnv2D(dt=args.dt)
     x0, obs_xy, obs_r, goal_xy, goal_r = random_world(N, args.num_obstacles, device=device)
 
-    x0      = x0.contiguous()
-    obs_xy  = obs_xy.contiguous()
-    obs_r   = obs_r.contiguous()
-    goal_xy = goal_xy.contiguous()
-    goal_r  = goal_r.contiguous()
+    # normalize layout/dtype
+    x0      = x0.contiguous().to(device=device, dtype=torch.float32)
+    obs_xy  = obs_xy.contiguous().to(device=device, dtype=torch.float32)
+    obs_r   = obs_r.contiguous().to(device=device, dtype=torch.float32)
+    goal_xy = goal_xy.contiguous().to(device=device, dtype=torch.float32)
+    goal_r  = goal_r.contiguous().to(device=device, dtype=torch.float32)
 
-        # ---------------- Hard robustness (torch, no specs module) ----------------
-    def _hard_rho_of(traj_T2):
+    # ---------- Hard robustness (torch, no specs module) ----------
+    def _hard_rho_of(traj_T2: torch.Tensor):
         """
         traj_T2: (T,2) positions for a single trajectory on current device.
-        Hard STL: G(avoid) ∧ F(reach)
+        STL: G(avoid) ∧ F(reach)
         """
         # G(avoid)
         if obs_xy.numel() > 0:
-            diff = traj_T2.unsqueeze(1) - obs_xy.unsqueeze(0)       # (T, nObs, 2)
-            dists = torch.linalg.norm(diff, dim=-1)                 # (T, nObs)
-            margins = dists - obs_r.unsqueeze(0)                    # (T, nObs)
-            rho_avoid_t = margins.min(dim=1).values                 # (T,)
+            diff = traj_T2.unsqueeze(1) - obs_xy.unsqueeze(0)     # (T, nObs, 2)
+            dists = torch.linalg.norm(diff, dim=-1)               # (T, nObs)
+            margins = dists - obs_r.unsqueeze(0)                  # (T, nObs)
+            rho_avoid_t = margins.min(dim=1).values               # (T,)
             G_avoid = rho_avoid_t.min()
         else:
             G_avoid = torch.tensor(1e6, device=traj_T2.device)
@@ -92,18 +117,16 @@ def main(args):
 
         return torch.minimum(G_avoid, F_reach)
 
-    # ---------------- Produce u_seq exactly once, based on baseline ----------------
+    # ---------- Produce u_seq exactly once, based on baseline ----------
     N = x0.shape[0]  # batch size
     t0 = time.time()
 
     if args.baseline == 'opt':
         from optimize_stl_annealed import optimize_controls_annealed
 
-        # how many starts to actually optimize (rest will use sampler fallback)
         opt_count = N if (args.opt_max is None or args.opt_max <= 0) else min(args.opt_max, N)
         u_seq = torch.zeros((N, args.T, 2), device=device)
 
-        # run optimizer for the first opt_count starts
         for i in range(opt_count):
             print(f"[opt] optimizing start {i+1}/{opt_count}…", flush=True)
             u_i, _ = optimize_controls_annealed(
@@ -117,7 +140,6 @@ def main(args):
                 u_i = torch.tensor(u_i, dtype=torch.float32, device=device)
             u_seq[i] = u_i.to(device)
 
-        # fill the remainder with our heuristic sampler
         if opt_count < N:
             from guidance import add_goal_bias
             u_fallback = sample_with_ddpm_or_fallback(N - opt_count, args.T, device=device, max_speed=1.6)
@@ -125,39 +147,57 @@ def main(args):
             u_seq[opt_count:] = u_fallback
 
     elif args.baseline == 'opt_from_rrt':
-        from rrtgeom import plan_rrt_star, path_to_controls
-        from optimize_stl_annealed import optimize_controls_annealed
+        from rrtgeom import plan_rrt_star
+        # safer helpers we control
+        try:
+            from rrt_bootstrap import path_to_controls as _bootstrap_path_to_controls
+        except Exception:
+            _bootstrap_path_to_controls = None
 
+        from optimize_stl_annealed import optimize_controls_annealed
         max_speed = 1.6
         u_seq = torch.zeros((N, args.T, 2), device=device)
-        # optionally only optimize a subset (keeps rigor; you’ll report budget)
         opt_count = N if (args.opt_max is None or args.opt_max <= 0) else min(args.opt_max, N)
+
+        # call wrapper so we tolerate different signatures
+        def _path_to_controls_wrapper(path, T, dt, max_speed, device):
+            if _bootstrap_path_to_controls is not None:
+                return _bootstrap_path_to_controls(path, T=T, dt=dt, max_speed=max_speed, device=device)
+            # fall back to rrtgeom if available
+            try:
+                from rrtgeom import path_to_controls as _rrt_path_to_controls
+                try:
+                    return _rrt_path_to_controls(path, T=T, dt=dt, max_speed=max_speed, device=device)
+                except TypeError:
+                    return _rrt_path_to_controls(path, T=T, dt=dt, max_speed=max_speed)
+            except Exception:
+                return None
 
         for i in range(opt_count):
             if (i % 25) == 0:
                 print(f"[opt] optimizing start {i+1}/{opt_count}…", flush=True)
 
+            # Pass numpy to avoid torch RNG/generator edge cases inside rrtgeom
             path = plan_rrt_star(
-            x0=x0[i],                         # tensor
-            goal_xy=goal_xy,                  # tensor
-            obs_xy=obs_xy,                    # tensor
-            obs_r=obs_r,                      # tensor
-            max_iter=4000, step=0.30, r_rewire=0.60,
-            goal_sample_rate=0.10, goal_thresh=float(goal_r.item()*0.9),
-            xmin=-5.0, xmax=5.0, ymin=-5.0, ymax=5.0,
-            seed=int(args.world_seed if args.world_seed is not None else 0)
-        )
-            if path is None or len(path) < 2:
-                # no warm start; zeros let optimizer try locally
-                init_u = None
-            else:
-                init_u = path_to_controls(path, T=args.T, dt=args.dt, max_speed=1.6, device=device)
+                x0=x0[i].detach().cpu().numpy(),
+                goal_xy=goal_xy.detach().cpu().numpy(),
+                obs_xy=obs_xy.detach().cpu().numpy(),
+                obs_r=obs_r.detach().cpu().numpy(),
+                max_iter=4000, step=0.30, r_rewire=0.60,
+                goal_sample_rate=0.10, goal_thresh=float(goal_r.item()*0.9),
+                xmin=-5.0, xmax=5.0, ymin=-5.0, ymax=5.0,
+                seed=int(args.world_seed if args.world_seed is not None else 0),
+            )
+
+            init_u = None
+            if path is not None and len(path) >= 2:
+                init_u = _path_to_controls_wrapper(path, T=args.T, dt=args.dt, max_speed=max_speed, device=device)
 
             u_i, _ = optimize_controls_annealed(
                 x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
                 goal_xy=goal_xy, goal_r=goal_r,
                 T=args.T, dt=args.dt, init_u=init_u,
-                hard_eval_fn=_hard_rho_of,  # your hard evaluator from earlier
+                hard_eval_fn=_hard_rho_of,
                 taus=(0.6, 0.3, 0.15, 0.08), iters_per_tau=80, lr=0.25, max_speed=max_speed
             )
             u_seq[i] = u_i.to(device)
@@ -168,44 +208,102 @@ def main(args):
             u_fallback = add_goal_bias(x0[opt_count:], u_fallback, goal_xy, dt=args.dt, beta=0.35, max_speed=max_speed)
             u_seq[opt_count:] = u_fallback
 
+    elif args.baseline == 'opt_basis_from_rrt':
+        from rrtgeom import plan_rrt_star
+        from rrt_bootstrap import path_to_knots
+        from optimize_basis_bridge import optimize_basis_from_knots
+
+        max_speed = 1.6
+        u_seq = torch.zeros((N, args.T, 2), device=device)
+
+        opt_count = N if (args.opt_max is None or args.opt_max <= 0) else min(args.opt_max, N)
+        warm_hits, plan_times = 0, []
+
+        K_knots = int(args.K_basis)
+
+        for i in range(opt_count):
+            if (i % 25) == 0:
+                print(f"[opt_basis] optimizing start {i+1}/{opt_count}…", flush=True)
+
+            t0p = time.time()
+            # Pass CPU tensors to RRT* (safer with CPU-only ops inside rrtgeom.py)
+            path = plan_rrt_star(
+                x0=x0[i].cpu(),
+                goal_xy=goal_xy.cpu(),
+                obs_xy=obs_xy.cpu(),
+                obs_r=obs_r.cpu(),
+                max_iter=8000,
+                step=0.25,
+                # remove r_rewire if your plan_rrt_star does not support it
+                # r_rewire=0.60,
+                goal_sample_rate=0.20,
+                xmin=-5.0, xmax=5.0, ymin=-5.0, ymax=5.0,
+                goal_thresh=float(goal_r.item()),
+                seed=int(args.world_seed if args.world_seed is not None else 0)
+            )
+            plan_times.append(time.time() - t0p)
+
+            init_knots = None
+            if path is not None and len(path) >= 2:
+                init_knots = path_to_knots(path, K=K_knots, device=device)
+                warm_hits += 1
+
+            u_i, _ = optimize_basis_from_knots(
+                x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+                goal_xy=goal_xy, goal_r=goal_r,
+                K=K_knots, T=args.T, dt=args.dt,
+                init_knots=init_knots,
+                iters=int(args.iters_basis),
+                lr=0.3, max_speed=max_speed,
+                hard_eval_fn=_hard_rho_of
+            )
+            u_seq[i] = u_i.to(device)
+
+        if opt_count > 0:
+            import numpy as _np
+            med_plan = float(_np.median(_np.array(plan_times))) if plan_times else 0.0
+            print(
+                f"[opt_basis_from_rrt] warm-starts used: {warm_hits}/{opt_count} "
+                f"({100.0*warm_hits/max(1,opt_count):.1f}%) | median RRT* plan {med_plan:.3f}s",
+                flush=True,
+            )
+
+        if opt_count < N:
+            from guidance import add_goal_bias
+            u_fallback = sample_with_ddpm_or_fallback(N - opt_count, args.T, device=device, max_speed=max_speed)
+            u_fallback = add_goal_bias(x0[opt_count:], u_fallback, goal_xy, dt=args.dt, beta=0.35, max_speed=max_speed)
+            u_seq[opt_count:] = u_fallback
+
 
     elif args.baseline == 'ours':
         from guidance import add_goal_bias
-        # from repair import one_step_repair  # optional
         u_seq = sample_with_ddpm_or_fallback(N, args.T, device=device, max_speed=1.6)
         u_seq = add_goal_bias(x0, u_seq, goal_xy, dt=args.dt, beta=0.35, max_speed=1.6)
-        # u_seq = one_step_repair(x0, u_seq, obs_xy, obs_r, dt=args.dt, alpha=1.2, d_safe=0.25)
 
     else:
         raise NotImplementedError(f"baseline {args.baseline} not wired yet")
 
-    # Simulate once
+    # ---------- Simulate & Evaluate ----------
     traj = env.simulate(x0, u_seq)
     t1 = time.time()
 
-
     if args.spec == 'gf_avoid_reach':
-        rho = chunked_eval(spec_G_avoid_and_F_reach, traj, obs_xy, obs_r, goal_xy, goal_r, chunk=args.chunk)
+        rho = chunked_eval(
+            spec_G_avoid_and_F_reach, traj, obs_xy, obs_r, goal_xy, goal_r, chunk=args.chunk
+        )
     else:
-        # bounded windows: convert seconds to indices with dt spacing (here we just use fractions of T)
         a1, b1 = int(0), int(args.T - 1)
         a2, b2 = int(0.3 * args.T), int(0.7 * args.T)
-        rho = chunked_eval(spec_bounded_avoid_then_reach, traj, obs_xy, obs_r, goal_xy, goal_r, a1, b1, a2, b2, chunk=args.chunk)
+        rho = chunked_eval(
+            spec_bounded_avoid_then_reach, traj, obs_xy, obs_r, goal_xy, goal_r, a1, b1, a2, b2, chunk=args.chunk
+        )
 
     passrate = (rho > 0).float().mean().item()
 
-    # Choose top-K for δ-SMT
+    # ---------- δ-SMT gate on top-K ----------
     mask = rho > args.rho_min
     idx_sorted = torch.argsort(rho, descending=True)
-    top_idx = [i.item() for i in idx_sorted if mask[i]][:args.K]
-
-
-
-    # δ-SMT stub stats
-    # before: from smt_stub import check_delta_sat
-    use_dreal = getattr(args, "dreal", False)
-    if use_dreal:
-        from verify_dreal import delta_sat_check
+    top_idx = [i.item() for i in idx_sorted if mask[i]][: args.K]
 
     acc = rej = near = 0
     backend = args.cert
@@ -216,59 +314,77 @@ def main(args):
             rej += 1
             continue
 
-        x0_i    = x0[i].detach().cpu().numpy().tolist()
-        u_i     = u_seq[i].detach().cpu().numpy().tolist()
-        obs_xy_i= obs_xy.detach().cpu().numpy().tolist()
-        obs_r_i = obs_r.detach().cpu().numpy().tolist()
+        x0_i      = x0[i].detach().cpu().numpy().tolist()
+        u_i       = u_seq[i].detach().cpu().numpy().tolist()
+        obs_xy_i  = obs_xy.detach().cpu().numpy().tolist()
+        obs_r_i   = obs_r.detach().cpu().numpy().tolist()
         goal_xy_i = goal_xy.detach().cpu().numpy().tolist()
         goal_r_i  = float(goal_r.item())
 
         ok = True
-        if backend == 'continuous':
-            from verify_continuous import continuous_check_traj
-            ok, _why = continuous_check_traj(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, goal_r_i)
-        elif backend == 'z3':
-            from verify_z3 import z3_check_traj
-            ok = z3_check_traj(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, goal_r_i)
-        elif backend == 'dreal':
-            from verify_dreal import delta_sat_check
-            ok = delta_sat_check(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, goal_r_i,
-                                delta=args.delta, dreal_path="dreal")
+        try:
+            if backend == 'continuous':
+                from verify_continuous import continuous_check_traj
+                ok, _why = continuous_check_traj(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, goal_r_i)
+            elif backend == 'z3':
+                from verify_z3 import z3_check_traj
+                ok = z3_check_traj(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, goal_r_i)
+            elif backend == 'dreal':
+                from verify_dreal import delta_sat_check
+                ok = delta_sat_check(
+                    x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, goal_r_i, delta=args.delta, dreal_path="dreal"
+                )
+            else:
+                ok = True
+        except Exception:
+            # Treat as "near" if the solver isn't available or crashes
+            ok = False
+
+        if ok:
+            acc += 1
         else:
-            ok = True  # no extra certification
+            near += 1
 
-        if ok: acc += 1
-        else:  near += 1
-
-
-
-    # Best traj
-    best_i = int(idx_sorted[0].item())
+    # --- best traj + throughput ---
+    best_i   = int(idx_sorted[0].item())
     best_traj = traj[best_i].detach().cpu().numpy()
     best_rho = float(rho[best_i].item())
+    gpu_traj_s = float(N) / max(1e-6, (t1 - t0))   # <-- now it's defined
 
-    # Throughput
-    gpu_traj_s = N / max(1e-6, (t1 - t0))
+    # --- logging (after we have acc/rej/near + gpu_traj_s) ---
+    import numpy as _np
+    _warm_hits   = locals().get("warm_hits", None)
+    _plan_times  = locals().get("plan_times", None)
+    _median_rrt  = float(_np.median(_np.array(_plan_times))) if _plan_times else None
+    _warm_hits_pct = (100.0 * _warm_hits / max(1, locals().get("opt_count", 0))) if _warm_hits is not None else None
 
-    # Log row
-    rec = dict(task=args.task, spec=args.spec, device=str(device), N=N, T=args.T, dt=args.dt,
-               num_obstacles=args.num_obstacles, passrate=passrate, success=passrate,
-               best_rho=best_rho, gpu_traj_s=gpu_traj_s, rho_min=args.rho_min, K=args.K, delta=args.delta,
-               accept_rate=acc / max(1, len(top_idx)), reject_rate=rej / max(1, N), near_feasible=near / max(1, len(top_idx)),
-               seed=args.seed, world_seed=world_seed_used,
-               goal_r=float(goal_r.item()),min_start_goal_dist=2.0,
-               los_block_required=True)
+    rec = dict(
+        task=args.task, spec=args.spec, baseline=args.baseline, device=str(device),
+        N=N, T=args.T, dt=args.dt, num_obstacles=args.num_obstacles,
+        passrate=passrate, success=passrate, best_rho=best_rho,
+        gpu_traj_s=gpu_traj_s, rho_min=args.rho_min, K=args.K, delta=args.delta,
+        accept_rate=acc / max(1, len(top_idx)),
+        reject_rate=rej / max(1, N),
+        near_feasible=near / max(1, len(top_idx)),
+        seed=args.seed, world_seed=world_seed_used,
+        goal_r=float(goal_r.item()), min_start_goal_dist=2.0, los_block_required=True,
+        opt_max=getattr(args, "opt_max", None),
+        K_basis=getattr(args, "K_basis", None),
+        iters_basis=getattr(args, "iters_basis", None),
+        warm_hits=_warm_hits, warm_hits_pct=_warm_hits_pct,
+        median_rrt_plan_s=_median_rrt,
+    )
     append_record("outputs/logs/records.csv", rec)
-    
-    # Plot
+
+    # --- plot + prints (unchanged) ---
     title = f"Success={passrate*100:.1f}% | Best ρ={best_rho:.3f} | N={N}"
     plot_world(best_traj,
-               obs_xy.detach().cpu().numpy(),
-               obs_r.detach().cpu().numpy(),
-               goal_xy.detach().cpu().numpy(),
-               float(goal_r.item()),
-               title,
-               f"outputs/plots/{args.task}_{args.spec}.png")
+            obs_xy.detach().cpu().numpy(),
+            obs_r.detach().cpu().numpy(),
+            goal_xy.detach().cpu().numpy(),
+            float(goal_r.item()),
+            title,
+            f"outputs/plots/{args.task}_{args.spec}.png")
 
     print(f"Device: {device}")
     print(f"N(adaptive)={N}, T={args.T}, dt={args.dt}, obstacles={args.num_obstacles}")
@@ -292,26 +408,27 @@ if __name__ == '__main__':
     p.add_argument('--delta', type=float, default=1e-2)
     p.add_argument('--seed', type=int, default=123, help='global RNG seed')
     p.add_argument('--world_seed', type=int, default=0, help='seed for world generation; -1 = random each run')
-    p.add_argument('--dreal', action='store_true', help='use dReal δ-SMT gate instead of stub')
-    p.add_argument('--smt', type=str, default='none', choices=['none','z3','dreal'],
-               help='choose SMT backend: none | z3 | dreal (dReal requires Linux/WSL)')
+    p.add_argument('--dreal', action='store_true', help='use dReal δ-SMT gate instead of stub')  # kept for CLI parity
+    p.add_argument('--smt', type=str, default='none', choices=['none', 'z3', 'dreal'],
+                   help='choose SMT backend: none | z3 | dreal (dReal requires Linux/WSL)')
     p.add_argument('--cert', type=str, default='continuous',
-               choices=['none','continuous','z3','dreal'],
-               help='final certification backend')
+                   choices=['none', 'continuous', 'z3', 'dreal'],
+                   help='final certification backend')
+
     p.add_argument('--baseline', type=str, default='ours',
-    choices=['ours','opt','rrt','opt_from_rrt','opt_from_ddpm'],
-    help='pipeline to run')
+                   choices=['ours', 'opt', 'rrt', 'opt_from_rrt', 'opt_from_ddpm', 'opt_basis_from_rrt'],
+                   help='pipeline to run')
+
     p.add_argument('--opt_max', type=int, default=None,
-                help='If set, only optimize this many starts; others use sampler.')
+                   help='If set, only optimize this many starts; others use sampler.')
     p.add_argument('--batch_opt', type=int, default=32,
-                help='Batch width for the (optional) batched optimizer path.')
+                   help='Batch width for the (optional) batched optimizer path.')
 
-
-
-
-
-
-
+    # basis controls
+    p.add_argument('--K_basis', type=int, default=8,
+                   help='Number of B-spline knots for basis optimization.')
+    p.add_argument('--iters_basis', type=int, default=200,
+                   help='Iterations per tau for basis optimizer.')
 
     args = p.parse_args()
     main(args)
