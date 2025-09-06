@@ -1,7 +1,7 @@
 import csv, os
 from datetime import datetime
 FIELDS = ["time","task","spec","device","N","T","dt","num_obstacles","passrate","success","best_rho",
-          "gpu_traj_s","rho_min","K","delta","accept_rate","reject_rate","near_feasible"]
+          "gpu_traj_s","rho_min","K","delta","accept_rate","reject_rate","near_feasible", "seed","world_seed","goal_r","min_start_goal_dist","los_block_required"]
 def append_record(path, rec: dict):
     exists = os.path.exists(path)
     with open(path, 'a', newline='') as f:

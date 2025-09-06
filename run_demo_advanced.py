@@ -52,9 +52,9 @@ def main(args):
     # gentler sampler (you already have the gentler defaults in samplers.py)
     u_seq = sample_with_ddpm_or_fallback(N, args.T, device=device, max_speed=1.6)
     # add a small goal-directed pull at each step
-    # u_seq = add_goal_bias(x0, u_seq, goal_xy, dt=args.dt, beta=0.35, max_speed=1.6)
+    u_seq = add_goal_bias(x0, u_seq, goal_xy, dt=args.dt, beta=0.35, max_speed=1.6)
     # stronger one-step repair to clear obstacles
-    u_seq = one_step_repair(x0, u_seq, obs_xy, obs_r, dt=args.dt, alpha=1.2, d_safe=0.25)
+    # u_seq = one_step_repair(x0, u_seq, obs_xy, obs_r, dt=args.dt, alpha=1.2, d_safe=0.25)
     # simulate for evaluation
     traj  = env.simulate(x0, u_seq)
     t1 = time.time()
@@ -75,16 +75,56 @@ def main(args):
     idx_sorted = torch.argsort(rho, descending=True)
     top_idx = [i.item() for i in idx_sorted if mask[i]][:args.K]
 
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+    import random, numpy as np
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    if args.world_seed is not None and args.world_seed >= 0:
+        ws = args.world_seed
+    else:
+        ws = torch.randint(0, 10_000_000, (1,)).item()
+    torch.manual_seed(ws)  # world sampling seed
+    world_seed_used = ws
+
     # δ-SMT stub stats
+    # before: from smt_stub import check_delta_sat
+    use_dreal = getattr(args, "dreal", False)
+    if use_dreal:
+        from verify_dreal import delta_sat_check
+
     acc = rej = near = 0
+    backend = args.smt
+
     for i in top_idx:
         r = float(rho[i].item())
         if r < 0:
             rej += 1
-        else:
-            ok = check_delta_sat(r, args.delta)
-            if ok: acc += 1
-            else:  near += 1
+            continue
+
+        ok = True
+        if backend == 'z3':
+            from verify_z3 import z3_check_traj
+            u_i = u_seq[i].detach().cpu().tolist()
+            x0_i = x0[i].detach().cpu().tolist()
+            obs_xy_i = obs_xy.detach().cpu().tolist()
+            obs_r_i  = obs_r.detach().cpu().tolist()
+            goal_xy_i= goal_xy.detach().cpu().tolist()
+            ok = z3_check_traj(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, float(goal_r.item()))
+        elif backend == 'dreal':
+            from verify_dreal import delta_sat_check
+            u_i = u_seq[i].detach().cpu().tolist()
+            x0_i = x0[i].detach().cpu().tolist()
+            obs_xy_i = obs_xy.detach().cpu().tolist()
+            obs_r_i  = obs_r.detach().cpu().tolist()
+            goal_xy_i= goal_xy.detach().cpu().tolist()
+            ok = delta_sat_check(x0_i, u_i, args.dt, obs_xy_i, obs_r_i, goal_xy_i, float(goal_r.item()),
+                                delta=args.delta, dreal_path="dreal")
+
+        if ok: acc += 1
+        else:  near += 1
+
 
     # Best traj
     best_i = int(idx_sorted[0].item())
@@ -98,9 +138,12 @@ def main(args):
     rec = dict(task=args.task, spec=args.spec, device=str(device), N=N, T=args.T, dt=args.dt,
                num_obstacles=args.num_obstacles, passrate=passrate, success=passrate,
                best_rho=best_rho, gpu_traj_s=gpu_traj_s, rho_min=args.rho_min, K=args.K, delta=args.delta,
-               accept_rate=acc / max(1, len(top_idx)), reject_rate=rej / max(1, N), near_feasible=near / max(1, len(top_idx)))
+               accept_rate=acc / max(1, len(top_idx)), reject_rate=rej / max(1, N), near_feasible=near / max(1, len(top_idx)),
+               seed=args.seed, world_seed=world_seed_used,
+               goal_r=float(goal_r.item()),min_start_goal_dist=2.0,
+               los_block_required=True)
     append_record("outputs/logs/records.csv", rec)
-
+    
     # Plot
     title = f"Success={passrate*100:.1f}% | Best ρ={best_rho:.3f} | N={N}"
     plot_world(best_traj,
@@ -131,5 +174,13 @@ if __name__ == '__main__':
     p.add_argument('--rho_min', type=float, default=0.03)
     p.add_argument('--K', type=int, default=16)
     p.add_argument('--delta', type=float, default=1e-2)
+    p.add_argument('--seed', type=int, default=123, help='global RNG seed')
+    p.add_argument('--world_seed', type=int, default=0, help='seed for world generation; -1 = random each run')
+    p.add_argument('--dreal', action='store_true', help='use dReal δ-SMT gate instead of stub')
+    p.add_argument('--smt', type=str, default='none', choices=['none','z3','dreal'],
+               help='choose SMT backend: none | z3 | dreal (dReal requires Linux/WSL)')
+
+
+
     args = p.parse_args()
     main(args)
