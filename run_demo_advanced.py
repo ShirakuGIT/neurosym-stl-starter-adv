@@ -45,12 +45,17 @@ def main(args):
     env = PointMassEnv2D(dt=args.dt)
     x0, obs_xy, obs_r, goal_xy, goal_r = random_world(N, args.num_obstacles, device=device)
 
-    from repair import one_step_repair
+    from guidance import add_goal_bias
+    from repair   import one_step_repair
 
     t0 = time.time()
-    u_seq = sample_with_ddpm_or_fallback(N, args.T, device=device, max_speed=1.6)  # gentler default
-    # one-step local repair (cheap) to push away from obstacles
-    u_seq = one_step_repair(x0, u_seq, obs_xy, obs_r, dt=args.dt, alpha=0.6, d_safe=0.15)
+    # gentler sampler (you already have the gentler defaults in samplers.py)
+    u_seq = sample_with_ddpm_or_fallback(N, args.T, device=device, max_speed=1.6)
+    # add a small goal-directed pull at each step
+    # u_seq = add_goal_bias(x0, u_seq, goal_xy, dt=args.dt, beta=0.35, max_speed=1.6)
+    # stronger one-step repair to clear obstacles
+    u_seq = one_step_repair(x0, u_seq, obs_xy, obs_r, dt=args.dt, alpha=1.2, d_safe=0.25)
+    # simulate for evaluation
     traj  = env.simulate(x0, u_seq)
     t1 = time.time()
 
