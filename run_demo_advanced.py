@@ -302,9 +302,7 @@ def main(args):
         model = TinyUNet(in_dim=2*K_ckpt, cond_dim=cond_dim, hidden=hidden, time_in_dim=time_in_dim).to(device)
         model.load_state_dict(state_dict, strict=True)
         model.eval()
-        model.Tdiff = Tdiff
-
-        
+        model.Tdiff = Tdiff 
 
         # --- derive max_obs for encode_env exactly like training ---
         if "max_obs" in meta:
@@ -314,9 +312,11 @@ def main(args):
             max_obs = int((cond_dim - 6) // 3)
         max_obs = max(0, max_obs)
 
-        print(f"[prior] K_ckpt={K_ckpt} cond_dim={cond_dim} time_in_dim={time_in_dim} Tdiff={Tdiff}")
-        print(f"[encode_env] max_obs={max_obs} -> cond_vec_dim_expected={cond_dim}")
- 
+        from prior_utils import encode_env
+        probe = encode_env(x0[0], obs_xy, obs_r, goal_xy, goal_r, max_obs=max_obs)
+        assert probe.shape[-1] == cond_dim, f"encode_env produced {probe.shape[-1]} but checkpoint expects {cond_dim}. Fix max_obs/encode_env."
+        print(f"[sanity] cond_dim ok: {probe.shape[-1]} == {cond_dim}")
+
         # --- runtime constants used below ---
         max_speed = 1.6
         u_seq = torch.zeros((N, args.T, 2), device=device)
@@ -330,6 +330,9 @@ def main(args):
         fallback_times   = []
 
         opt_count = N if (args.opt_max is None or args.opt_max <= 0) else min(args.opt_max, N)
+        
+        steps = min(args.prior_steps, model.Tdiff) if args.prior_steps is not None else None
+
 
         for i in range(opt_count):
             if (i % 25) == 0:
@@ -337,23 +340,17 @@ def main(args):
 
             found = False
             cond_vec = encode_env(x0[i], obs_xy, obs_r, goal_xy, goal_r, max_obs=max_obs)
-            print(f"[encode_env] cond_vec.shape={tuple(cond_vec.shape)}")
 
             for s in range(int(args.hybrid_ddpm_samples)):
                 ddpm_draws_total += 1
-                knots0 = sample_knots_ddpm(
-                    model, cond_vec, K=int(args.K_basis),
-                    steps=(args.prior_steps or None), device=device
-                )
-
-                # 1) quick basis refine from DDPM knots
+                K_use = K_ckpt
+                knots0 = sample_knots_ddpm(model, cond_vec, K=K_use, steps=steps, device=device)
                 u_i, hard_rho = optimize_basis_from_knots(
                     x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
                     goal_xy=goal_xy, goal_r=goal_r,
-                    K=int(args.K_basis), T=args.T, dt=args.dt,
+                    K=K_use, T=args.T, dt=args.dt,
                     init_knots=knots0,
-                    iters=int(args.hybrid_refine_iters),
-                    lr=0.3, max_speed=max_speed,
+                    iters=int(args.hybrid_refine_iters), lr=0.3, max_speed=max_speed,
                     hard_eval_fn=_hard_rho_of
                 )
 
@@ -364,8 +361,8 @@ def main(args):
                     found = True
                     break
 
-                # 3) optional micro-repair on near-miss, then short re-refine
-                if getattr(args, "use_micro_repair", False):
+                # 3) optional micro-repair only for near-miss
+                if getattr(args, "use_micro_repair", False) and (-0.03 <= float(hard_rho) <= args.rho_min):
                     repaired = micro_repair_knots(
                         knots0, x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
                         goal_xy=goal_xy, goal_r=goal_r, T=args.T, dt=args.dt,
@@ -384,6 +381,7 @@ def main(args):
                         ddpm_success += 1
                         found = True
                         break
+
 
 
 
@@ -465,11 +463,18 @@ def main(args):
         K_ckpt      = int(meta.get("K", args.K_basis))
         cond_dim    = int(meta.get("cond_dim", args.prior_cond_dim))
         Tdiff       = int(meta.get("Tdiff", 1000))
-        # if max_obs not stored, derive from cond_dim: cond_dim = 6 + 3*max_obs  (with encode_env layout)
+        # --- derive max_obs for encode_env exactly like training ---
         if "max_obs" in meta:
             max_obs = int(meta["max_obs"])
         else:
+            # encode_env layout: 2 (x0) + 2 (goal) + 1 (goal_r) + 2*max_obs + max_obs + 1 (n_obs)
             max_obs = int((cond_dim - 6) // 3)
+        max_obs = max(0, max_obs)
+        
+        from prior_utils import encode_env
+        probe = encode_env(x0[0], obs_xy, obs_r, goal_xy, goal_r, max_obs=max_obs)
+        assert probe.shape[-1] == cond_dim, f"encode_env produced {probe.shape[-1]} but checkpoint expects {cond_dim}. Fix max_obs/encode_env."
+        print(f"[sanity] cond_dim ok: {probe.shape[-1]} == {cond_dim}")
 
         # --- runtime constants *before* any use ---
         max_speed = 1.6
@@ -484,13 +489,7 @@ def main(args):
         model.eval()
         model.Tdiff = Tdiff  # sampler uses this
 
-        # --- derive max_obs for encode_env exactly like training ---
-        if "max_obs" in meta:
-            max_obs = int(meta["max_obs"])
-        else:
-            # encode_env layout: 2 (x0) + 2 (goal) + 1 (goal_r) + 2*max_obs + max_obs + 1 (n_obs)
-            max_obs = int((cond_dim - 6) // 3)
-        max_obs = max(0, max_obs)
+        
 
         # --- runtime constants used below ---
         max_speed = 1.6
@@ -504,6 +503,7 @@ def main(args):
         u_seq = torch.zeros((N, args.T, 2), device=device)
 
         opt_count = N if (args.opt_max is None or args.opt_max <= 0) else min(args.opt_max, N)
+        steps = min(args.prior_steps, model.Tdiff) if args.prior_steps is not None else None
 
         for i in range(opt_count):
             if (i % 25) == 0:
@@ -514,23 +514,16 @@ def main(args):
 
             # Sample K knots using the trained prior (use K from ckpt)
             K_use = K_ckpt
-            knots0 = sample_knots_ddpm(
-                model, cond_vec, K=K_use,
-                steps=(args.prior_steps if args.prior_steps is not None else None),
-                device=device
-            )
-
-            # Refine with basis optimizer (you can still choose to optimize to args.K_basis,
-            # but keeping K consistent avoids any conversion; simplest is to use K_use)
+            knots0 = sample_knots_ddpm(model, cond_vec, K=K_use, steps=steps, device=device)
             u_i, hard_rho = optimize_basis_from_knots(
-            x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
-            goal_xy=goal_xy, goal_r=goal_r,
-            K=K_use, T=args.T, dt=args.dt,
-            init_knots=knots0,
-            iters=int(getattr(args, 'iters_basis', 200)),
-            lr=0.3, max_speed=max_speed,
-            hard_eval_fn=_hard_rho_of
-        )
+                x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+                goal_xy=goal_xy, goal_r=goal_r,
+                K=K_use, T=args.T, dt=args.dt,
+                init_knots=knots0,
+                iters=int(args.hybrid_refine_iters), lr=0.3, max_speed=max_speed,
+                hard_eval_fn=_hard_rho_of
+            )
+        
 
         # optional micro-repair if below threshold
         if float(hard_rho) <= args.rho_min and args.use_micro_repair:
@@ -664,6 +657,12 @@ def main(args):
         hy_fb_succ    = locals().get('_hy_fb_succ', None),
         hy_fb_med_s   = locals().get('_hy_fb_med', None),
     ))
+
+    rec.update(dict(
+        ddpm_win_rate = (locals().get('_hy_ddpm_succ', 0) / max(1, locals().get('_hy_ddpm_draws', 0))),
+        fb_call_rate  = (locals().get('_hy_fb_calls', 0) / max(1, locals().get('opt_count', 1))),
+        fb_success_rate = (locals().get('_hy_fb_succ', 0) / max(1, locals().get('_hy_fb_calls', 0))),
+        ))
     append_record("outputs/logs/records.csv", rec)
 
     # --- plot + prints (unchanged) ---

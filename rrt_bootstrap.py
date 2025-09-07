@@ -1,53 +1,6 @@
 # rrt_bootstrap.py
 import torch
 import numpy as np
-from tqdm import tqdm
-
-from rrtstar import RRTStarPlanner # CORRECTED CLASS NAME IMPORT
-from control_basis import get_traj_spline
-
-def find_knots_rrt(env, rrt_time, rrt_iter):
-    """
-    Finds a trajectory satisfying the spec using RRT*, then returns the
-    control points (knots) for a B-spline that approximates the path.
-    """
-    # CORRECTED CLASS NAME INSTANTIATION
-    planner = RRTStarPlanner(
-        env.start_pos.cpu().numpy(),
-        env.spec.spec_dict['goal']['center'].cpu().numpy(),
-        env,
-        max_time=rrt_time,
-        max_iter=rrt_iter,
-        goal_sample_rate=0.1,
-        rewire_neighborhood_size=16.0
-    )
-    
-    path = planner.plan()
-    if path is None:
-        return None
-    
-    path = torch.from_numpy(path).float().to(env.start_pos.device)
-    
-    # Fit a B-spline to the RRT path to get a smooth trajectory
-    knots = get_traj_spline(
-        path.T,
-        K=env.K,
-        T=env.T
-    ).T
-    
-    # Check if the resulting spline trajectory is valid
-    controls = knots[1:] - knots[:-1]
-    if knots.shape[0] > 1:
-        traj = torch.cumsum(torch.cat([knots[0].unsqueeze(0), controls], dim=0), dim=0)
-    else:
-        traj = knots
-    
-    robs = env.spec.get_robs(traj.unsqueeze(0))
-    if robs.item() > 0:
-        return knots
-    
-    return None
-
 
 def resample_polyline(points_xy, T, dt, max_speed=1.6, device="cpu"):
     """
