@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import torch
 # add these imports
 from prior_utils import encode_env, sample_knots_ddpm
-
+from micro_repair import micro_repair_knots
 
 from envs import PointMassEnv2D, random_world
 from samplers import sample_with_ddpm_or_fallback
@@ -277,6 +277,141 @@ def main(args):
             u_fallback = add_goal_bias(x0[opt_count:], u_fallback, goal_xy, dt=args.dt, beta=0.35, max_speed=max_speed)
             u_seq[opt_count:] = u_fallback
 
+    elif args.baseline == 'opt_basis_from_ddpm_hybrid':
+        assert args.prior_ckpt is not None, "Provide --prior_ckpt"
+
+        from prior_model import TinyUNet
+        from prior_utils import encode_env, sample_knots_ddpm
+        from optimize_basis_bridge import optimize_basis_from_knots
+        from rrtgeom import plan_rrt_star
+        from rrt_bootstrap import path_to_knots
+
+        # --- load prior ---
+        ckpt = torch.load(args.prior_ckpt, map_location=device)
+        sd   = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
+        meta = ckpt.get('meta', {}) if isinstance(ckpt, dict) else {}
+        K_ckpt   = int(meta.get('K', args.K_basis))
+        cond_dim = int(meta.get('cond_dim', args.prior_cond_dim))
+        Tdiff    = int(meta.get('Tdiff', 1000))
+
+        model = TinyUNet(in_dim=2*K_ckpt, cond_dim=cond_dim).to(device)
+        model.load_state_dict(sd)
+        model.eval()
+        model.Tdiff = Tdiff
+
+        max_speed = 1.6
+        u_seq = torch.zeros((N, args.T, 2), device=device)
+
+        # logging counters
+        ddpm_draws_total = 0
+        ddpm_success     = 0
+        fallback_calls   = 0
+        fallback_success = 0
+        fallback_times   = []
+
+        opt_count = N if (args.opt_max is None or args.opt_max <= 0) else min(args.opt_max, N)
+
+        for i in range(opt_count):
+            if (i % 25) == 0:
+                print(f"[hybrid] start {i+1}/{opt_count}…", flush=True)
+
+            # ---- try DDPM S times with small basis refine ----
+            found = False
+            cond_vec = encode_env(x0[i], obs_xy, obs_r, goal_xy, goal_r, max_obs=8)
+            for s in range(int(args.hybrid_ddpm_samples)):
+                ddpm_draws_total += 1
+                knots0 = sample_knots_ddpm(model, cond_vec, K=int(args.K_basis),
+                                        steps=(args.prior_steps or None), device=device)
+
+                # First: quick basis refine of the sampled knots
+                u_i, hard_rho = optimize_basis_from_knots(
+                    x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+                    goal_xy=goal_xy, goal_r=goal_r,
+                    K=int(args.K_basis), T=args.T, dt=args.dt,
+                    init_knots=knots0,
+                    iters=int(args.hybrid_refine_iters),
+                    lr=0.3, max_speed=max_speed,
+                    hard_eval_fn=_hard_rho_of
+                )
+
+                if float(hard_rho) > args.rho_min:
+                    u_seq[i] = u_i
+                    ddpm_success += 1
+                    found = True
+                    break
+
+                # ---- micro-repair on near-miss (optional) ----
+                if args.use_micro_repair:
+                    repaired = micro_repair_knots(
+                        knots0, x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+                        goal_xy=goal_xy, goal_r=goal_r, T=args.T, dt=args.dt,
+                        steps=6, lr=0.08, trust_radius=0.15
+                    )
+                    u_i2, hard_rho2 = optimize_basis_from_knots(
+                        x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+                        goal_xy=goal_xy, goal_r=goal_r,
+                        K=int(args.K_basis), T=args.T, dt=args.dt,
+                        init_knots=repaired,
+                        iters=20, lr=0.3, max_speed=max_speed,
+                        hard_eval_fn=_hard_rho_of
+                    )
+                    if float(hard_rho2) > args.rho_min:
+                        u_seq[i] = u_i2
+                        ddpm_success += 1
+                        found = True
+                        break
+
+
+
+            if found:
+                continue
+
+            # ---- fallback: one RRT* with time/iter cap + refine ----
+            fallback_calls += 1
+            import time as _t
+            t0p = _t.time()
+            path = plan_rrt_star(
+                x0=x0[i].cpu(), goal_xy=goal_xy.cpu(), obs_xy=obs_xy.cpu(), obs_r=obs_r.cpu(),
+                max_iter=int(args.hybrid_rrt_iter), step=0.30, goal_sample_rate=0.20,
+                xmin=-5.0, xmax=5.0, ymin=-5.0, ymax=5.0,
+                goal_thresh=float(goal_r.item()),
+                seed=int(args.world_seed if args.world_seed is not None else 0),
+                max_time=float(args.hybrid_rrt_time)
+            )
+            fallback_times.append(_t.time() - t0p)
+
+            init_knots = path_to_knots(path, K=int(args.K_basis)) if (path is not None and len(path) >= 2) else None
+            u_i, hard_rho = optimize_basis_from_knots(
+                x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+                goal_xy=goal_xy, goal_r=goal_r,
+                K=int(args.K_basis), T=args.T, dt=args.dt,
+                init_knots=init_knots,
+                iters=int(args.hybrid_rrt_refine_iters),
+                lr=0.3, max_speed=max_speed,
+                hard_eval_fn=_hard_rho_of
+            )
+            u_seq[i] = u_i
+            if float(hard_rho) > args.rho_min:
+                fallback_success += 1
+
+        # fill remainder with cheap sampler if needed
+        if opt_count < N:
+            from guidance import add_goal_bias
+            u_fallback = sample_with_ddpm_or_fallback(N - opt_count, args.T, device=device, max_speed=max_speed)
+            u_fallback = add_goal_bias(x0[opt_count:], u_fallback, goal_xy, dt=args.dt, beta=0.35, max_speed=max_speed)
+            u_seq[opt_count:] = u_fallback
+
+        # stash hybrid stats for the logger below
+        import numpy as _np
+        locals().update(dict(
+            _hy_ddpm_draws=ddpm_draws_total,
+            _hy_ddpm_succ=ddpm_success,
+            _hy_fb_calls=fallback_calls,
+            _hy_fb_succ=fallback_success,
+            _hy_fb_med=float(_np.median(_np.array(fallback_times))) if fallback_times else None,
+        ))
+
+
 
     elif args.baseline == 'ours':
         from guidance import add_goal_bias
@@ -344,16 +479,37 @@ def main(args):
 
             # Refine with basis optimizer (you can still choose to optimize to args.K_basis,
             # but keeping K consistent avoids any conversion; simplest is to use K_use)
-            u_i, _ = optimize_basis_from_knots(
+            u_i, hard_rho = optimize_basis_from_knots(
+            x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+            goal_xy=goal_xy, goal_r=goal_r,
+            K=K_use, T=args.T, dt=args.dt,
+            init_knots=knots0,
+            iters=int(getattr(args, 'iters_basis', 200)),
+            lr=0.3, max_speed=max_speed,
+            hard_eval_fn=_hard_rho_of
+        )
+
+        # optional micro-repair if below threshold
+        if float(hard_rho) <= args.rho_min and args.use_micro_repair:
+            repaired = micro_repair_knots(
+                knots0, x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
+                goal_xy=goal_xy, goal_r=goal_r, T=args.T, dt=args.dt,
+                steps=6, lr=0.08, trust_radius=0.15
+            )
+            u_i2, hard_rho2 = optimize_basis_from_knots(
                 x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
                 goal_xy=goal_xy, goal_r=goal_r,
                 K=K_use, T=args.T, dt=args.dt,
-                init_knots=knots0,
-                iters=int(getattr(args, 'iters_basis', 200)),
-                lr=0.3, max_speed=max_speed,
+                init_knots=repaired,
+                iters=20, lr=0.3, max_speed=max_speed,
                 hard_eval_fn=_hard_rho_of
             )
-            u_seq[i] = u_i.to(device)
+            if float(hard_rho2) > args.rho_min:
+                u_i = u_i2  # adopt repaired solution
+
+
+        u_seq[i] = u_i.to(device)
+
 
         if opt_count < N:
             from guidance import add_goal_bias
@@ -457,6 +613,14 @@ def main(args):
         warm_hits=_warm_hits, warm_hits_pct=_warm_hits_pct,
         median_rrt_plan_s=_median_rrt,
     )
+
+    rec.update(dict(
+        hy_ddpm_draws = locals().get('_hy_ddpm_draws', None),
+        hy_ddpm_succ  = locals().get('_hy_ddpm_succ', None),
+        hy_fb_calls   = locals().get('_hy_fb_calls', None),
+        hy_fb_succ    = locals().get('_hy_fb_succ', None),
+        hy_fb_med_s   = locals().get('_hy_fb_med', None),
+    ))
     append_record("outputs/logs/records.csv", rec)
 
     # --- plot + prints (unchanged) ---
@@ -497,7 +661,7 @@ if __name__ == '__main__':
     p.add_argument('--cert', type=str, default='continuous',
                    choices=['none', 'continuous', 'z3', 'dreal'],
                    help='final certification backend')
-
+    p.add_argument('--use_micro_repair', action='store_true')
     p.add_argument('--baseline', type=str, default='ours',
                     choices=['ours','opt','rrt','opt_from_rrt','opt_from_ddpm','opt_basis_from_rrt','opt_basis_from_ddpm'],
                     help='pipeline to run')
@@ -517,6 +681,12 @@ if __name__ == '__main__':
     p.add_argument('--prior_steps', type=int, default=None, help='Override diffusion steps for sampling')
     p.add_argument('--prior_cond_dim', type=int, default=30)
     p.add_argument('--prior_hidden', type=int, default=256)
+    p.add_argument('--hybrid_ddpm_samples', type=int, default=4, help='DDPM knot draws per start before fallback')
+    p.add_argument('--hybrid_rrt_time', type=float, default=0.6, help='Seconds cap for RRT* in hybrid fallback')
+    p.add_argument('--hybrid_rrt_iter', type=int, default=3000, help='Iter cap for RRT* in hybrid fallback')
+    p.add_argument('--hybrid_refine_iters', type=int, default=60, help='Basis iters per DDPM draw in hybrid')
+    p.add_argument('--hybrid_rrt_refine_iters', type=int, default=80, help='Basis iters after fallback RRT*')
+
 
     args = p.parse_args()
     main(args)
