@@ -287,20 +287,40 @@ def main(args):
         from rrt_bootstrap import path_to_knots
 
         # --- load prior ---
-        ckpt = torch.load(args.prior_ckpt, map_location=device)
-        sd   = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
-        meta = ckpt.get('meta', {}) if isinstance(ckpt, dict) else {}
-        K_ckpt   = int(meta.get('K', args.K_basis))
-        cond_dim = int(meta.get('cond_dim', args.prior_cond_dim))
-        Tdiff    = int(meta.get('Tdiff', 1000))
+        ckpt = torch.load(args.prior_ckpt, map_location="cpu")
+        state_dict = ckpt.get("model", ckpt)  # supports {'model':..., 'meta':...} or raw sd
+        meta = ckpt.get("meta", {})
 
-        model = TinyUNet(in_dim=2*K_ckpt, cond_dim=cond_dim).to(device)
-        model.load_state_dict(sd)
+        # infer meta/params
+        K_ckpt      = int(meta.get("K", args.K_basis))
+        cond_dim    = int(meta.get("cond_dim", args.prior_cond_dim))
+        Tdiff       = int(meta.get("Tdiff", 1000))
+        hidden      = int(getattr(args, "prior_hidden", 256))
+        time_in_dim = state_dict["time_mlp.0.weight"].shape[1] if "time_mlp.0.weight" in state_dict else 1
+
+        # build exactly like training
+        model = TinyUNet(in_dim=2*K_ckpt, cond_dim=cond_dim, hidden=hidden, time_in_dim=time_in_dim).to(device)
+        model.load_state_dict(state_dict, strict=True)
         model.eval()
         model.Tdiff = Tdiff
 
+        
+
+        # --- derive max_obs for encode_env exactly like training ---
+        if "max_obs" in meta:
+            max_obs = int(meta["max_obs"])
+        else:
+            # encode_env layout: 2 (x0) + 2 (goal) + 1 (goal_r) + 2*max_obs + max_obs + 1 (n_obs)
+            max_obs = int((cond_dim - 6) // 3)
+        max_obs = max(0, max_obs)
+
+        print(f"[prior] K_ckpt={K_ckpt} cond_dim={cond_dim} time_in_dim={time_in_dim} Tdiff={Tdiff}")
+        print(f"[encode_env] max_obs={max_obs} -> cond_vec_dim_expected={cond_dim}")
+ 
+        # --- runtime constants used below ---
         max_speed = 1.6
         u_seq = torch.zeros((N, args.T, 2), device=device)
+
 
         # logging counters
         ddpm_draws_total = 0
@@ -315,15 +335,18 @@ def main(args):
             if (i % 25) == 0:
                 print(f"[hybrid] start {i+1}/{opt_count}…", flush=True)
 
-            # ---- try DDPM S times with small basis refine ----
             found = False
-            cond_vec = encode_env(x0[i], obs_xy, obs_r, goal_xy, goal_r, max_obs=8)
+            cond_vec = encode_env(x0[i], obs_xy, obs_r, goal_xy, goal_r, max_obs=max_obs)
+            print(f"[encode_env] cond_vec.shape={tuple(cond_vec.shape)}")
+
             for s in range(int(args.hybrid_ddpm_samples)):
                 ddpm_draws_total += 1
-                knots0 = sample_knots_ddpm(model, cond_vec, K=int(args.K_basis),
-                                        steps=(args.prior_steps or None), device=device)
+                knots0 = sample_knots_ddpm(
+                    model, cond_vec, K=int(args.K_basis),
+                    steps=(args.prior_steps or None), device=device
+                )
 
-                # First: quick basis refine of the sampled knots
+                # 1) quick basis refine from DDPM knots
                 u_i, hard_rho = optimize_basis_from_knots(
                     x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
                     goal_xy=goal_xy, goal_r=goal_r,
@@ -334,14 +357,15 @@ def main(args):
                     hard_eval_fn=_hard_rho_of
                 )
 
+                # 2) accept if good enough
                 if float(hard_rho) > args.rho_min:
                     u_seq[i] = u_i
                     ddpm_success += 1
                     found = True
                     break
 
-                # ---- micro-repair on near-miss (optional) ----
-                if args.use_micro_repair:
+                # 3) optional micro-repair on near-miss, then short re-refine
+                if getattr(args, "use_micro_repair", False):
                     repaired = micro_repair_knots(
                         knots0, x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
                         goal_xy=goal_xy, goal_r=goal_r, T=args.T, dt=args.dt,
@@ -363,6 +387,8 @@ def main(args):
 
 
 
+
+
             if found:
                 continue
 
@@ -380,7 +406,7 @@ def main(args):
             )
             fallback_times.append(_t.time() - t0p)
 
-            init_knots = path_to_knots(path, K=int(args.K_basis)) if (path is not None and len(path) >= 2) else None
+            init_knots = path_to_knots(path, K=int(args.K_basis), device=device) if (path is not None and len(path) >= 2) else None
             u_i, hard_rho = optimize_basis_from_knots(
                 x0=x0[i], obs_xy=obs_xy, obs_r=obs_r,
                 goal_xy=goal_xy, goal_r=goal_r,
@@ -445,6 +471,10 @@ def main(args):
         else:
             max_obs = int((cond_dim - 6) // 3)
 
+        # --- runtime constants *before* any use ---
+        max_speed = 1.6
+        u_seq = torch.zeros((N, args.T, 2), device=device)
+
         hidden = int(getattr(args, "prior_hidden", 256))
 
         # --- instantiate model to match ckpt ---
@@ -453,6 +483,19 @@ def main(args):
         model.load_state_dict(state_dict, strict=True)
         model.eval()
         model.Tdiff = Tdiff  # sampler uses this
+
+        # --- derive max_obs for encode_env exactly like training ---
+        if "max_obs" in meta:
+            max_obs = int(meta["max_obs"])
+        else:
+            # encode_env layout: 2 (x0) + 2 (goal) + 1 (goal_r) + 2*max_obs + max_obs + 1 (n_obs)
+            max_obs = int((cond_dim - 6) // 3)
+        max_obs = max(0, max_obs)
+
+        # --- runtime constants used below ---
+        max_speed = 1.6
+        u_seq = torch.zeros((N, args.T, 2), device=device)
+
 
         from optimize_basis_bridge import optimize_basis_from_knots
         from prior_utils import encode_env, sample_knots_ddpm
@@ -663,7 +706,7 @@ if __name__ == '__main__':
                    help='final certification backend')
     p.add_argument('--use_micro_repair', action='store_true')
     p.add_argument('--baseline', type=str, default='ours',
-                    choices=['ours','opt','rrt','opt_from_rrt','opt_from_ddpm','opt_basis_from_rrt','opt_basis_from_ddpm'],
+                    choices=['ours','opt','rrt','opt_from_rrt','opt_from_ddpm','opt_basis_from_rrt','opt_basis_from_ddpm', 'opt_basis_from_ddpm_hybrid'],
                     help='pipeline to run')
 
     p.add_argument('--opt_max', type=int, default=None,
